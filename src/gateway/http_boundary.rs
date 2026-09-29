@@ -1,173 +1,58 @@
-//! Admission and clean teardown outside the pinned SDK's aborting DELETE.
+//! Bounded HTTP admission outside the SDK's native graceful teardown.
 use super::*;
-use axum::{
-    body::Body,
-    http::{Method, header},
-};
-use std::sync::Weak;
-use tower::ServiceExt as _;
+use axum::http::{Method, header};
+use tokio::sync::Semaphore;
 
 const MAX_BODY: usize = 1024 * 1024;
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-pub(super) const DRAIN_METHOD: &str = "_kit/gateway/drain";
+const MAX_REQUESTS: usize = 32;
 
-#[derive(Default)]
 pub(super) struct Boundary {
-    // Writers: admission lookup/prune only. Weak entries retire on completion,
-    // cancellation, or unwind; arbitrary connection IDs cannot accumulate.
-    admission: Mutex<HashMap<String, Weak<Mutex<bool>>>>,
-    // Writers: DELETE publishes, adapter acknowledges/removes, next DELETE
-    // prunes expired entries. The drain task owns the only strong sender.
-    drains: Mutex<HashMap<String, Weak<watch::Sender<bool>>>>,
+    // Each outer POST/DELETE owns one permit until its HTTP future finishes
+    // or is dropped. The SDK independently owns connection draining.
+    requests: Arc<Semaphore>,
 }
 
-impl Boundary {
-    async fn gate(&self, id: &str) -> Arc<Mutex<bool>> {
-        let mut gates = self.admission.lock().await;
-        gates.retain(|_, gate| gate.strong_count() != 0);
-        if let Some(gate) = gates.get(id).and_then(Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(Mutex::new(false));
-        gates.insert(id.to_owned(), Arc::downgrade(&gate));
-        gate
-    }
-
-    pub(super) async fn acknowledge(&self, token: &str) {
-        let sender = self
-            .drains
-            .lock()
-            .await
-            .remove(token)
-            .and_then(|s| s.upgrade());
-        // Wake the DELETE task outside the registry guard. An expired barrier
-        // is harmless: its timed-out DELETE did not abort the SDK connection.
-        if let Some(sender) = sender {
-            sender.send_replace(true);
+impl Default for Boundary {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
         }
     }
 }
 
 pub(super) async fn handle(
-    State((boundary, sdk)): State<(Arc<Boundary>, Router)>,
-    mut request: axum::extract::Request,
+    State(boundary): State<Arc<Boundary>>,
+    request: axum::extract::Request,
     next: Next,
 ) -> Response {
     if request.uri().path() != "/acp/v2" {
         return next.run(request).await;
     }
-    if request.method() == Method::POST {
-        if request
+    if !matches!(*request.method(), Method::POST | Method::DELETE) {
+        return next.run(request).await;
+    }
+    let Ok(permit) = boundary.requests.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway request admission is full; request was not admitted; prior submission outcome may be unknown; do not resubmit accepted work",
+        )
+            .into_response();
+    };
+    if request.method() == Method::POST
+        && request
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|length| length > MAX_BODY as u64)
-        {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        }
-        // DefaultBodyLimit does not constrain the SDK's raw Request handler.
-        // Consume with an actual byte bound, including chunked/unknown lengths,
-        // before parsing or allowing any frame into the SDK mailbox.
-        let (parts, body) = request.into_parts();
-        let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
-            Ok(bytes) => bytes,
-            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        };
-        request = axum::extract::Request::from_parts(parts, Body::from(bytes));
-    }
-    if !matches!(*request.method(), Method::POST | Method::DELETE) {
-        return next.run(request).await;
-    }
-    let Some(id) = request.headers().get("acp-connection-id").cloned() else {
-        return next.run(request).await;
-    };
-    let Ok(id_text) = id.to_str() else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let gate = boundary.gate(id_text).await;
-    let mut closing = gate.lock().await;
-    if *closing {
-        return (
-            StatusCode::CONFLICT,
-            "connection teardown is draining accepted requests",
-        )
-            .into_response();
-    }
-    if request.method() == Method::POST {
-        // This admission lease deliberately spans only the SDK HTTP handler,
-        // which queues the frame before returning 202, not actor execution.
-        // Cancellation drops the lease; SDK enqueue itself is synchronous.
-        let response = next.run(request).await;
-        drop(closing);
-        return response;
-    }
-
-    // This private acknowledgement capability must not be guessable by an
-    // authenticated client that can enqueue arbitrary ACP extension methods.
-    let mut nonce = [0_u8; 32];
-    if getrandom::fill(&mut nonce).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let token: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
-    let payload = object([
-        ("jsonrpc", "2.0".into()),
-        ("method", DRAIN_METHOD.into()),
-        ("params", object([("token", token.clone().into())])),
-    ]);
-    let mut barrier = axum::extract::Request::new(Body::from(payload.to_string()));
-    *barrier.method_mut() = Method::POST;
-    *barrier.uri_mut() = request.uri().clone();
-    barrier.headers_mut().insert("acp-connection-id", id);
-    barrier.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
-    );
-    let (sender, mut acknowledged) = watch::channel(false);
-    let owner = Arc::new(sender);
     {
-        let mut drains = boundary.drains.lock().await;
-        drains.retain(|_, sender| sender.strong_count() != 0);
-        drains.insert(token, Arc::downgrade(&owner));
-        // Complete publication and stop admission together, with no await
-        // before transferring ownership to the cancellation-independent task.
-        *closing = true;
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    drop(closing);
-    let work = tokio::spawn(async move {
-        let _owner = owner;
-        // Re-enter the unwrapped SDK router to select POST. Next is already
-        // bound to the selected DELETE route and cannot redispatch methods.
-        let response = match sdk.oneshot(barrier).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        };
-        if response.status() == StatusCode::NOT_FOUND {
-            return response;
-        }
-        let drained = response.status() == StatusCode::ACCEPTED
-            && matches!(
-                tokio::time::timeout(DRAIN_TIMEOUT, acknowledged.wait_for(|ready| *ready)).await,
-                Ok(Ok(_))
-            );
-        if !drained {
-            // Never claim successful teardown or invoke the aborting SDK
-            // DELETE when accepted work has not crossed the actor boundary.
-            *gate.lock().await = false;
-            return (StatusCode::SERVICE_UNAVAILABLE, "accepted request drain was not confirmed; teardown was not performed; submission outcome unknown; do not resubmit work").into_response();
-        }
-        let response = next.run(request).await;
-        drop(gate);
-        response
-    });
-    match work.await {
-        Ok(response) => response,
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "connection teardown failed; submission outcome unknown",
-        )
-            .into_response(),
-    }
+    // The SDK bounds actual bytes (including unknown lengths), atomically
+    // seals ingress on DELETE, and owns draining independently of this waiter.
+    let response = next.run(request).await;
+    drop(permit);
+    response
 }
 
 #[cfg(test)]
@@ -179,84 +64,107 @@ mod tests {
         clippy::disallowed_macros
     )]
     use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt as _;
 
-    fn request(method: Method) -> axum::extract::Request {
-        let mut request = axum::extract::Request::new(Body::from("{}"));
+    fn request(method: Method, body: Body) -> axum::extract::Request {
+        let mut request = axum::extract::Request::new(body);
         *request.uri_mut() = "/acp/v2".parse().unwrap();
         *request.method_mut() = method;
-        request.headers_mut().insert(
-            "acp-connection-id",
-            header::HeaderValue::from_static("connection"),
-        );
-        request.headers_mut().insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
         request
     }
 
-    fn wrapped(sdk: Router) -> Router {
-        sdk.clone().layer(middleware::from_fn_with_state(
-            (Arc::new(Boundary::default()), sdk),
+    fn wrapped(service: Router) -> Router {
+        service.layer(middleware::from_fn_with_state(
+            Arc::new(Boundary::default()),
             handle,
         ))
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn unconfirmed_drain_does_not_delete_and_reopens_admission() {
-        // Fake the SDK HTTP boundary, not internal drain hooks. A 202 without
-        // adapter acknowledgement must never reach the destructive DELETE.
-        let sdk = Router::new().route(
-            "/acp/v2",
-            axum::routing::post(|| async { StatusCode::ACCEPTED })
-                .delete(|| async { StatusCode::IM_A_TEAPOT }),
-        );
-        let app = wrapped(sdk);
-        let deletion = tokio::spawn(app.clone().oneshot(request(Method::DELETE)));
-        loop {
-            let response = app.clone().oneshot(request(Method::POST)).await.unwrap();
-            if response.status() == StatusCode::CONFLICT {
-                break;
-            }
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(DRAIN_TIMEOUT).await;
-        assert_eq!(
-            deletion.await.unwrap().unwrap().status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            app.oneshot(request(Method::POST)).await.unwrap().status(),
-            StatusCode::ACCEPTED
-        );
+    fn pending_body() -> Body {
+        Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >())
+    }
+
+    fn unpollable_body() -> Body {
+        Body::from_stream(futures_util::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<axum::body::Bytes, std::io::Error>>> {
+                panic!("rejected request body must not be polled")
+            },
+        ))
+    }
+
+    async fn read_body(request: axum::extract::Request) -> StatusCode {
+        axum::body::to_bytes(request.into_body(), MAX_BODY)
+            .await
+            .unwrap();
+        StatusCode::ACCEPTED
     }
 
     #[tokio::test]
-    async fn sdk_unwind_retires_gate_without_claiming_success() {
-        async fn sdk_post(Json(message): Json<Value>) -> StatusCode {
-            assert_ne!(
-                message["method"], DRAIN_METHOD,
-                "SDK failure at the actual HTTP boundary"
+    async fn saturation_rejects_before_body_poll_and_cancellation_reuses_permit() {
+        // This service tests outer HTTP admission, not SDK drain semantics.
+        for admitted_method in [Method::POST, Method::DELETE] {
+            let app = wrapped(
+                Router::new().route("/acp/v2", axum::routing::post(read_body).delete(read_body)),
             );
-            StatusCode::ACCEPTED
+            let mut waiting = Vec::new();
+            for _ in 0..MAX_REQUESTS {
+                let mut pending = Box::pin(
+                    app.clone()
+                        .oneshot(request(admitted_method.clone(), pending_body())),
+                );
+                assert!(futures_util::poll!(&mut pending).is_pending());
+                waiting.push(pending);
+            }
+            for method in [Method::POST, Method::DELETE] {
+                assert_eq!(
+                    app.clone()
+                        .oneshot(request(method, unpollable_body()))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+            drop(waiting.pop());
+            // Each completion must release the same freed slot for reuse.
+            for method in [Method::POST, Method::DELETE] {
+                assert_eq!(
+                    app.clone()
+                        .oneshot(request(method, Body::empty()))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::ACCEPTED
+                );
+            }
         }
-        let app = wrapped(Router::new().route(
-            "/acp/v2",
-            axum::routing::post(sdk_post).delete(|| async { StatusCode::IM_A_TEAPOT }),
-        ));
-        assert_eq!(
-            app.clone()
-                .oneshot(request(Method::DELETE))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_rejects_before_body_poll_and_releases_permit() {
+        let app = wrapped(Router::new().route("/acp/v2", axum::routing::post(read_body)));
+        // More rejections than capacity detects a permit leaked on preflight.
+        for _ in 0..=MAX_REQUESTS {
+            let mut oversized = request(Method::POST, unpollable_body());
+            oversized.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from_str(&(MAX_BODY + 1).to_string()).unwrap(),
+            );
+            assert_eq!(
+                app.clone().oneshot(oversized).await.unwrap().status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        let mut within_limit = request(Method::POST, Body::empty());
+        within_limit.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_str(&MAX_BODY.to_string()).unwrap(),
         );
-        // The panicking task releases its ownership; weak registrations cannot
-        // leave an otherwise usable connection permanently marked closing.
         assert_eq!(
-            app.oneshot(request(Method::POST)).await.unwrap().status(),
+            app.oneshot(within_limit).await.unwrap().status(),
             StatusCode::ACCEPTED
         );
     }
